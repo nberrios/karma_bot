@@ -4,6 +4,7 @@ import sys
 import time
 import sqlite3
 from curio import run, socket, sleep, run_in_thread
+from curio.errors import TaskCancelled
 from curio.socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 
 
@@ -26,7 +27,7 @@ class KarmaBot(object):
         self.command_nick = self.nick.lower()
         self._socket = None
         self._connected = False
-        self.exit_code = '.{0} quit'.format(nick.lower())
+        self.exit_code = '.{0} quit'.format(self.nick.lower())
         if not db:
             db = sqlite3.connect('karma.db', check_same_thread=False)
         self.db = db
@@ -254,7 +255,45 @@ class KarmaBot(object):
                 if recv_msg.find('PING :') != -1:
                     await self.respond_to_ping()
 
-async def main():
+async def main(server, port):
+    bot = KarmaBot(server, port)
+    try:
+        await bot._connect()
+    except ConnectionError as error:
+        print('Connection Error:', error)
+        bot.db.close()
+        sys.exit(1)
+    try:
+        await bot.listen()
+    except (TaskCancelled, KeyboardInterrupt) as signal:
+        print('Shutting down... because:', signal)
+        bot.db.close()
+        sys.exit(0)
+    except Exception as error:
+        print('Error:', error)
+        bot.db.close()
+        sys.exit(1)
+    else:
+        bot.db.close()
+        sys.exit(0)
+
+def initdb():
+    '''run this if you wanna init the database'''
+    db = sqlite3.connect('karma.db')
+    cursor = db.cursor()
+    cursor.execute('CREATE TABLE users(id INTEGER PRIMARY KEY, '
+                   'name TEXT, '
+                   'karma INTEGER)')
+    try:
+        db.commit()
+    except Exception as error:
+        print('Got error initializing the database', error)
+        db.rollback()
+        db.close()
+    else:
+        db.close()
+
+if __name__ == '__main__':
     if len(sys.argv) != 2:
         raise RuntimeError(
             'Insufficient arguments. '
@@ -275,42 +314,4 @@ async def main():
         port = 6667
         if len(address) == 2:
             port = int(address[1])
-        bot = KarmaBot(server, port)
-        try:
-            await bot._connect()
-        except ConnectionError as error:
-            print('Connection Error:', error)
-            bot.db.close()
-            sys.exit(1)
-        try:
-            await bot.listen()
-        except (CancelledTask, KeyboardInterrupt) as signal:
-            print('Shutting down... because:', signal)
-            bot.db.close()
-            sys.exit(0)
-        except Exception as error:
-            print('Error:', error)
-            bot.db.close()
-            sys.exit(1)
-        else:
-            bot.db.close()
-            sys.exit(0)
-
-def initdb():
-    '''run this if you wanna init the database'''
-    db = sqlite3.connect('karma.db')
-    cursor = db.cursor()
-    cursor.execute('CREATE TABLE users(id INTEGER PRIMARY KEY, '
-                   'name TEXT, '
-                   'karma INTEGER)')
-    try:
-        db.commit()
-    except Exception as error:
-        print('Got error initializing the database', error)
-        db.rollback()
-        db.close()
-    else:
-        db.close()
-
-if __name__ == '__main__':
-    run(main, with_monitor=True)
+    run(main(server, port), with_monitor=True)
