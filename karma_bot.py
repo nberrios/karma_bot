@@ -1,17 +1,32 @@
 #!/usr/bin/env python
+import argparse
+import asyncio
 import re
 import sys
 import time
 import sqlite3
+import json
+import aiohttp
+from functools import partial
 from curio import run, socket, sleep, run_in_thread
+from curio.bridge import AsyncioLoop, asyncio_coroutine
 from curio.errors import TaskCancelled
 from curio.socket import AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 
+parser = argparse.ArgumentParser()
+parser.add_argument("server", help="the IRC server address")
+parser.add_argument("--port", help="the IRC server's port (defaults to 6667)", type=int, default=6667)
+parser.add_argument("--proxy", help="proxy URL to tunnel requests through (WIP)")
+parser.add_argument("--initdb", help="initialize the database")
+arguments = parser.parse_args()
 
 encoding = 'UTF-8'
 
 karma_pattern = r'(?:((@?[aA-zZ\w]+)|[\'"].+?[\'"]))(?:(\+{2,}|\-{2,}))'
 karma_reg = re.compile(karma_pattern)
+
+strawpoll_pattern = r'[\'"]([^\'"]*)[\'"]'
+strawpoll_reg = re.compile(strawpoll_pattern)
 
 class ConnectionError(Exception):
     pass
@@ -19,15 +34,17 @@ class ConnectionError(Exception):
 
 class KarmaBot(object):
 
-    def __init__(self, server, port, user='kbot', nick=None, db=None):
+    def __init__(self, server, port, user='kbot', nick=None, db=None, proxy=None):
         self.server = server
         self.port = port
         self.user = user
         self.nick = nick if nick else 'KarmaBot'
         self.command_nick = self.nick.lower()
         self._socket = None
+        self.polls = {}
         self._connected = False
         self.exit_code = '.{0} quit'.format(self.nick.lower())
+        self.proxy = proxy
         if not db:
             db = sqlite3.connect('karma.db', check_same_thread=False)
         self.db = db
@@ -243,6 +260,52 @@ class KarmaBot(object):
                         await self.send_msg(header, target=channel)
                         for result in results:
                             await self.send_msg('{0}: {1}'.format(result[1], result[2]), target=channel)
+                if message[:19] == '.karmabot strawpoll':
+                    error = ("Not enough arguments supplied for strawpoll command. "
+                             "<PollTitle> <quoted options separated by spaces>"
+                             "Ex: .strawpollbot strawpoll 'Where shall we eat "
+                             "today?' 'Ramensan' 'Ajida' 'Slurping Turtle'")
+                    args = message.split(' ', 2)
+                    if len(args) != 3:
+                        await self.send_msg(error, target=channel)
+                    else:
+                        try:
+                            pollID, options = self.parseStrawPollArgs(args[2])
+                        except ValueError as error:
+                            await self.send_msg(
+                                'Not enough arguments to create a '
+                                'Strawpoll. Please provide a poll title, '
+                                'and at least 2 poll options',
+                                target=channel)
+                        else:
+                            data = {}
+                            data['title'] = pollID
+                            data['options'] = options
+                            data['multi'] = False
+                            payload = json.dumps(data)
+                            loop = asyncio.get_event_loop()
+                            session = aiohttp.ClientSession(loop=loop)
+                            async with AsyncioLoop(event_loop=loop) as aioloop:
+                                try:
+                                    resp = await aioloop.run_asyncio(partial(
+                                        session.request,
+                                            'POST',
+                                            'http://www.strawpoll.me/api/v2/polls',
+                                            data=payload,
+                                            timeout=None,
+                                            proxy=self.proxy))
+                                except aiohttp.client_exceptions.ClientConnectionError as err:
+                                    print(err)
+                                    await self.send_msg('I wasn\'t able to contact the '
+                                                  'strawpoll server... ;(', target=channel)
+                                else:
+                                    resp_data = await resp.json()
+                                    self.polls[str(resp_data['id'])] = resp_data['title']
+                                    await self.send_msg('Poll \'{0}\': {1}'.format(
+                                        resp_data['title'],
+                                        'http://www.strawpoll.me/' + str(resp_data['id'])),
+                                        target=channel)
+                                    session.close()
                 if message[:14] == '.{0} help'.format(self.command_nick):
                     await self.send_msg('Commands available:', target=channel)
                     await self.send_msg('.{0} [join|leave] [#server1, #server2, ...]'.format(self.command_nick), target=channel)
@@ -255,8 +318,26 @@ class KarmaBot(object):
                 if recv_msg.find('PING :') != -1:
                     await self.respond_to_ping()
 
-async def main(server, port):
-    bot = KarmaBot(server, port)
+    @staticmethod
+    async def asyncio_request(method, url, payload, session):
+        resp = await session.request(
+            method,
+            url,
+            data=payload,
+            timeout=None,
+            proxy='http://www-proxy-adcq7-new.us.oracle.com:80')
+
+    def parseStrawPollArgs(self, args):
+        parsed = strawpoll_reg.findall(args)
+        print(parsed)
+        if len(parsed) < 3:
+            raise ValueError('Not enough args for strawpoll')
+        pollTitle = parsed[0]
+        options = parsed[1:]
+        return (pollTitle, options)
+
+async def main(server, port, proxy):
+    bot = KarmaBot(server, port, proxy=proxy)
     try:
         await bot._connect()
     except ConnectionError as error:
@@ -294,24 +375,10 @@ def initdb():
         db.close()
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        raise RuntimeError(
-            'Insufficient arguments. '
-            'Run `python karma_bot.py help` for options')
-    argument = sys.argv[1]
-    if argument == 'help':
-        print('Usage (must be using python3.5+):')
-        print('To initialize the database: `python karma_bot.py initdb`')
-        print('To run the karma bot: `python karma_bot.py <server:port>`')
-        sys.exit(0)
-    elif argument == 'initdb':
+    if arguments.initdb:
         initdb()
         print('Database initialized')
-        sys.exit(0)
-    else:
-        address = argument.split(':', 1)
-        server = address[0]
-        port = 6667
-        if len(address) == 2:
-            port = int(address[1])
-    run(main(server, port), with_monitor=True)
+    server = arguments.server
+    port = arguments.port
+    proxy = arguments.proxy
+    run(main(server, port, proxy), with_monitor=True)
