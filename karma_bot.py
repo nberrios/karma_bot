@@ -318,15 +318,6 @@ class KarmaBot(object):
                 if recv_msg.find('PING :') != -1:
                     await self.respond_to_ping()
 
-    @staticmethod
-    async def asyncio_request(method, url, payload, session):
-        resp = await session.request(
-            method,
-            url,
-            data=payload,
-            timeout=None,
-            proxy='http://www-proxy-adcq7-new.us.oracle.com:80')
-
     def parseStrawPollArgs(self, args):
         parsed = strawpoll_reg.findall(args)
         print(parsed)
